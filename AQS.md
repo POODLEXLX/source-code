@@ -29,17 +29,21 @@ protected final boolean compareAndSetState(int expect, int update) {
 }
 ```
 ### 同步队列
+AQS中主要通过一个同步双向队列来完成线程获取资源的排队工作。当线程获锁失败时，会将该线程加入到同步队列中。*线程的控制信息被保持在其上一个节点中*。主要通过waitStatus来判断线程是否应该被阻塞的。排在队列中的第一个线程会去尝试获取锁，但不保证能够获取成功。
 ```java
 static final class Node {
+	//标记是否为共享还是独占模式
     static final Node SHARED = new Node();
     static final Node EXCLUSIVE = null;
 
+	/**
+	等待状态： CANCELLED-
+	**/
     static final int CANCELLED =  1;
     static final int SIGNAL    = -1;
     static final int CONDITION = -2;
     static final int PROPAGATE = -3;
 
-  
     volatile int waitStatus;
 
     volatile Node prev;
