@@ -123,6 +123,7 @@ static final class Node {
 ```
 ### addWaiter
 同步队列中
+![alter aqs节点](aqs.png)
 ```java
 主要是新建一个node并把它加入到队尾。入参标识释放为共享锁,独占为null。
 private Node addWaiter(Node mode) {
