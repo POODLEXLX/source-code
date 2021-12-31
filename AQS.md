@@ -122,23 +122,197 @@ static final class Node {
 } 	
 ```
 ### addWaiter
-同步队列中
+下面是同步队列的示意图
 ![alter aqs节点](aqs.png)
+其中的head和tail分别代表头尾节点，它们都是懒加载
+head节点除了初始化之外，只能通过setHead方法来修改。**如果头节点存在，那么它的waitStatus不可能为CANCELLED**，且头节点只是一个虚节点，只表示有线程占用了锁，且该节点下不对应线程。数据节点真正从第二个节点开始。
+
 ```java
-主要是新建一个node并把它加入到队尾。入参标识释放为共享锁,独占为null。
+private transient volatile Node head;
+private transient volatile Node tail;
+```
+addWaiter本质就是一个在队列最后添加一个尾节点的操作
+```java
+//主要是新建一个node并把它加入到队尾。入参标识释放为共享锁,独占为null。
 private Node addWaiter(Node mode) {
     Node node = new Node(Thread.currentThread(), mode);
     Node pred = tail;
     //如果尾结点不为空，将当前节点设置为尾结点
     if (pred != null) {
         node.prev = pred;
+        //CAS设置当前节点为尾结点，同state，使用的unsafe
         if (compareAndSetTail(pred, node)) {
             pred.next = node;
             return node;
         }
     }
+    //如果尾节点为空或者CAS设置当前节点为尾结点失败
     enq(node);
     return node;
 }
 ```
-队列的
+如果尾节点为空，则队列还未初始化，需要先初始化头节点和尾结点
+```java
+private Node enq(final Node node) {
+    for (;;) {
+        Node t = tail;
+        if (t == null) { 
+        //初始化头节点，注意初始化的头节点并不是当前线程的节点，而是使用无参构造函数
+            if (compareAndSetHead(new Node()))
+        //此时队伍中只有一个头节点，将尾结点指向该节点
+                tail = head;
+        } else {
+        //自旋设置当前节点为尾节点
+            node.prev = t;
+            if (compareAndSetTail(t, node)) {
+                t.next = node;
+                return t;
+            }
+        }
+    }
+}
+```
+执行完addWorker之后，线程入队列成功。至于节点后续如何，以及何时出队列，我们来看下acquireQueued方法
+### acquireQueued
+首先线程入队列之后，是马上进行阻塞吗？阻塞意味着需要从用户态切换到内核态，唤醒时需要从内核态切换到用户态，开销较大。所以AQS先是让线程自旋竞争锁。但是如果锁被其他线程占着，一直自旋也不行。所以通过其前一节点的waitStatus来判断是否需要自旋还是阻塞。
+```java
+final boolean acquireQueued(final Node node, int arg) {
+	//是否成功拿到锁
+   boolean failed = true;
+   try {
+       boolean interrupted = false;
+       //自旋：线程被中断或者被唤醒（除刚进入该方法）
+       for (;;) {
+           final Node p = node.predecessor();
+           //1.前一节点为头节点，且竞争锁（执行完释放锁或者被interrupt）
+           if (p == head && tryAcquire(arg)) {
+               //将当前节点设置为头节点，原头节点出列
+               setHead(node);
+               //原头节点没有可达性，会被垃圾回收
+               p.next = null; 
+               //成功获取到锁
+               failed = false;
+               //返回线程是否被中断过
+               return interrupted;
+           }
+           //2.前节点不为头节点，或者获锁失败
+    //此时需要判断当前节点是否需要被阻塞（阻塞必要条件是：前继节点的状态为SIGNAL。）防止无限自旋浪费资源
+           if (shouldParkAfterFailedAcquire(p, node) &&
+               parkAndCheckInterrupt())
+               //记录等待过程中是否被中断，只要中断一次也算
+               interrupted = true;
+       }
+   } finally {
+   		//添加失败会执行该方法，park时候需要不可预知异常，或者调用doAcquireSharedInterruptibly，此处只是一个保险代码，确保节点拿到锁或者被取消
+       if (failed)
+           cancelAcquire(node);
+   }
+}
+```
+先看第一步：获锁成功，将当前节点设为头节点。此时获得锁的只有当前线程，故不存在并发问题，无需CAS操作。头节点是虚节点，不保存除waitStatus、next以外的其他信息，此处将thread和prev都清空。
+因为当前线程获取到锁，线程的信息保存在exclusiveOwnerThread中。
+```java
+private void setHead(Node node) {
+   head = node;
+   node.thread = null;
+   node.prev = null;
+}
+```
+
+接着看第二步，获锁失败，判断是否应该阻塞
+### shouldParkAfterFailedAcquire
+**当前节点的线程是否应该被阻塞，主要看前节点是否为SIGNAL**
+如果前节点状态是取消状态，则将prev指针指向前面最近的不为取消状态的节点。
+```java
+private static boolean shouldParkAfterFailedAcquire(Node pred, Node node) {
+	//1.如果前节点为SIGNAL，则当前节点可以被阻塞，直接返回
+   int ws = pred.waitStatus;
+   if (ws == Node.SIGNAL)
+       return true;
+   //2.前节点为取消状态
+   if (ws > 0) {
+       do {
+       //将取消节点从队列中剔除，目前只剔除了tail ——>head这条方向(即prev)
+           node.prev = pred = pred.prev;
+       } while (pred.waitStatus > 0);
+       pred.next = node;
+   } else {
+   		//3.将前节点设置为SIGNAL，后面线程自旋又会走到第一步
+       compareAndSetWaitStatus(pred, ws, Node.SIGNAL);
+   }
+   return false;
+}
+```
+第二步有点绕，我画个图再解释下：
+![alter 初始](aqs-shouldParkAfterFailedAcquire.jpg)
+假设此时队列中有4个节点，节点T2、T3为取消状态，（取消见cancelAcquire）
+![alter 移除失效](aqs-shouldParkAfterFailedAcquire2.jpg)
+### parkAndCheckInterrupt
+该方法主要是挂起线程的
+```java
+private final boolean parkAndCheckInterrupt() {
+   //线程进入waiting状态，挂起当前线程
+   //恢复的条件有：1.调用unpark 2.线程中断 3.不可预知错误 （该方法不会抛出异常）
+   LockSupport.park(this);
+   //返回线程是否被中断了(会消耗中断标识)
+   return Thread.interrupted();
+}
+```
+### cancelAcquire
+正常不会执行到该步，但是当调用park遇到问题或者调用诸如doAcquireNanos之类的方法直接抛出异常时，不走获锁成功流程。为了确保节点能够从队伍中正常移除，需要执行该方法
+```java
+private void cancelAcquire(Node node) {
+   if (node == null)
+       return;
+   //清除失效节点的线程    
+   node.thread = null;
+	//和上面一样，将node的prev指向之前第一个非取消节点，剔除prev方向的失效节点
+   Node pred = node.prev;
+   while (pred.waitStatus > 0)
+       node.prev = pred = pred.prev;
+	//经过滤后的前节点（P）的next节点
+   Node predNext = pred.next;
+	//将当前节点设为取消
+   node.waitStatus = Node.CANCELLED;
+	//如果当前节点是尾节点，则使用CAS将过滤后的（P）设为tail
+	//如果cas成功，则将（P）的next置为空
+   if (node == tail && compareAndSetTail(node, pred)) {
+       compareAndSetNext(pred, predNext, null);
+   } else {
+   //如果当前不是尾节点，或者设置（P）为尾节点失败（即当前节点有后继节点）
+   //取消当前节点，那么就需要将（P）的next指向当前节点的后继节点，这边做的主要是剔除next方向的失效节点
+   //前面讲过唤醒或者阻塞节点，所以在设置（P）的后继节点时候，需要确保（P）是SIGNAL
+       int ws;
+       if (pred != head &&
+           ((ws = pred.waitStatus) == Node.SIGNAL ||
+            (ws <= 0 && compareAndSetWaitStatus(pred, ws, Node.SIGNAL))) &&
+           pred.thread != null) {
+           Node next = node.next;
+           if (next != null && next.waitStatus <= 0)
+               compareAndSetNext(pred, predNext, next);
+       } else {
+       //其他情况我们需要唤醒头节点后继节点(后面释放锁再讨论)
+           unparkSuccessor(node);
+       }
+       node.next = node; // help GC
+   }
+}
+```
+执行完大致成这个样子：
+![alter 取消节点](aqs-shouldParkAfterFailedAcquire3.jpg)
+后面当T1不可达时，取消节点也会被垃圾回收
+## lock.unlock
+释放锁，将state设置为0
+```java
+public final boolean release(int arg) {
+	//尝试释放锁成功
+   if (tryRelease(arg)) {
+       Node h = head;
+       if (h != null && h.waitStatus != 0)
+           //锁释放成功，唤醒head之后的节点来竞争锁
+           unparkSuccessor(h);
+       return true;
+   }
+   return false;
+}
+```
