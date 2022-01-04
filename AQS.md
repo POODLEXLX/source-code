@@ -301,6 +301,7 @@ private void cancelAcquire(Node node) {
 执行完大致成这个样子：
 ![alter 取消节点](aqs-shouldParkAfterFailedAcquire3.jpg)
 后面当T1不可达时，取消节点也会被垃圾回收
+
 ## lock.unlock
 释放锁，将state设置为0
 ```java
@@ -314,5 +315,48 @@ public final boolean release(int arg) {
        return true;
    }
    return false;
+}
+```
+唤醒节点的条件为：h != null && h.waitStatus != 0 的原因是：
+1. 如果h == null，头节点还没有被初始化，即还没有节点加入到队列，故不需要唤醒
+2. 如果h != null && h.waitStatus == 0，说明后继节点还在自旋竞争锁，还未被阻塞故不需要唤醒
+3. 头节点不存在取消状态，故waitStatus不会大于0
+### tryRelease
+```java
+protected final boolean tryRelease(int releases) {
+		//减少重入次数
+    int c = getState() - releases;
+    //当前线程没有持有锁，尝试释放锁肯定抛异常
+    if (Thread.currentThread() != getExclusiveOwnerThread())
+        throw new IllegalMonitorStateException();
+    boolean free = false;
+    //持有线程全部释放，当前锁没有线程占有，释放exclusiveOwnerThread
+    if (c == 0) {
+        free = true;
+        setExclusiveOwnerThread(null);
+    }
+    //此时只有当前线程持有锁，setStatus不存在并发问题，直接设值
+    setState(c);
+    return free;
+}
+```
+### unparkSuccessor
+```java
+private void unparkSuccessor(Node node) {
+		//正在唤醒后继节点，将head的waitStatus恢复默认值，这样后继节点在获锁的时候，可以再次尝试获取一次（acquireQueued），CAS设置失败也不影响唤醒操作
+    int ws = node.waitStatus;
+    if (ws < 0)
+        compareAndSetWaitStatus(node, ws, 0);
+		//获取队列中第一个非取消的节点
+    Node s = node.next;
+    //节点为空，或者为取消状态
+    if (s == null || s.waitStatus > 0) {
+        s = null;
+        for (Node t = tail; t != null && t != node; t = t.prev)
+            if (t.waitStatus <= 0)
+                s = t;
+    }
+    if (s != null)
+        LockSupport.unpark(s.thread);
 }
 ```
