@@ -352,6 +352,7 @@ private void unparkSuccessor(Node node) {
     //节点为空，或者为取消状态
     if (s == null || s.waitStatus > 0) {
         s = null;
+        //从tail往前查第一个非取消节点
         for (Node t = tail; t != null && t != node; t = t.prev)
             if (t.waitStatus <= 0)
                 s = t;
@@ -360,3 +361,8 @@ private void unparkSuccessor(Node node) {
         LockSupport.unpark(s.thread);
 }
 ```
+为什么从tail往前查是因为前面addWait插入节点不是原子操作，具体是：
+![alter addwait](addwait.jpg)
+如果unparkSuccessor刚好在此时执行，可能head可能找不到后继节点
+## 公平锁与非公平锁
+主要区别在于lock()与tryAcquire()方法上面，公平锁会优先判断等待队列中是否有节点，而非公平锁则直接进行抢占资源，抢占失败才会加入到等待队列中。
