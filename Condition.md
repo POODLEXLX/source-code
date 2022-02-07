@@ -60,19 +60,26 @@ static final int CONDITION = -2;
 Node nextWaiter;
 ```
 ## condition.await()
+使线程等待，知道被唤醒或者发送**中断**(抛出异常)。
+线程在阻塞后，返回该方法之前，必须重新获取与该条件相关联的锁。
 首先要明确的是，**在调用await方法之前，线程肯定是获得锁的**。
 ```java
 public final void await() throws InterruptedException {
     if (Thread.interrupted())
         throw new InterruptedException();
+    //添加到条件队列的尾部
     Node node = addConditionWaiter();
+    //释放当前锁，并返回当前重入数
     int savedState = fullyRelease(node);
     int interruptMode = 0;
+    //判断节点是否在同步队列中，如果不在，则让其在条件队列阻塞着
     while (!isOnSyncQueue(node)) {
         LockSupport.park(this);
+        //此处是被唤醒了或者是中断了；中断则跳出循环。
         if ((interruptMode = checkInterruptWhileWaiting(node)) != 0)
             break;
     }
+    //线程去抢锁
     if (acquireQueued(node, savedState) && interruptMode != THROW_IE)
         interruptMode = REINTERRUPT;
     if (node.nextWaiter != null) // clean up if cancelled
